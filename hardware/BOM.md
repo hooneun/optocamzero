@@ -15,7 +15,7 @@ Doruk Kumkumoğlu 2026
 | [Camera Adapter Cable – Raspberry Pi Zero compatible (200mm)](https://thepihut.com/products/camera-adapter-cable-for-raspberry-pi-5) | x1 |
 | 14500 Type 3.7V 900 mAh Li-ion Battery | x1 |
 | Micro JST 1.25 Pitch 2 Pin Male and Female Connector Set (With 24 AWG Cable) — or 24 AWG cable (≥50cm length) | x1 |
-| [2×20 Double Row Male GPIO Header](https://thepihut.com/products/break-away-0-1-2x20-pin-strip-dual-male-header) | x1 |
+| [2×20 Double Row Male GPIO Header](https://thepihut.com/products/break-away-0-1-2x20-pin-strip-dual-male-header) | x1 | If you can find non-standard 8-9mm pin headers, it's better
 | 0.3mm Ø Enameled Copper Wire (≥30cm length) — or any thin signal cable | x1 |
 
 <br>
