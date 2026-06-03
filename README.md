@@ -6,8 +6,6 @@ I designed Optocam Zero to have a very compact, carry everywhere and have fun so
 
 ![exploded view](assets/DSCG1663.jpg)
 
-<br>
-
 ## Features
 - Very compact and easy to carry in your pocket.
 - Intuitive and simple camera interface and controls.
