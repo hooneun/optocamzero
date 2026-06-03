@@ -72,6 +72,8 @@ Camera focus is set to continuous auto and cannot be adjusted manually. Camera s
 
 Currently, 8 different photo filters are included. You can switch between them. Color temperature can also be changed.
 
+![Camera Screens](https://github.com/dorukkumkumoglu/optocamzero/blob/main/assets/optocam-screens.png)
+
 ### Main camera preview screen controls
 - Top left corner displays current color temperature (left-right joystick toggles between different color temperature modes).
 - Top right corner displays current photo filter (up-down joystick toggles between different photo filters).
