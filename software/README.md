@@ -106,8 +106,5 @@ After opening the address in a browser, the transfer interface will appear. All 
 - In single image view, use the left-right arrow keys or swipe left-right to browse between photos.
 - To view the full resolution image, click the HQ button in single image view.
 
-![Transfer Interface2](https://github.com/dorukkumkumoglu/optocamzero/blob/main/assets/hotspot-interface-2.png)
-
-
 
 
