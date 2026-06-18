@@ -38,7 +38,7 @@ Note: If you can find non-standard 8-9mm lenght pin headers, use those instead o
 | Item | Qty |
 |------|-----|
 | M3×6mm Stainless Steel Hex-Drive Flat Head Screw (for lanyard accessory) | x2 |
-| M3 Stainless Steel Nut (Ffor lanyard accessory) | x2 |
+| M3 Stainless Steel Nut (for lanyard accessory) | x2 |
 
 <br>
 
