@@ -80,6 +80,8 @@ Currently, 8 different photo filters are included. You can switch between them. 
 - Bottom left corner displays current ISO.
 - Bottom right corner displays current shutter speed.
 - A loading circle appears in the bottom center when an image is being saved. Wait for it to disappear before turning off the camera.
+- A long press of the shutter button switches between GIF and Photo modes.
+- In GIF mode, pressing the shutter button once captures a 10 frame GIF with a duration of 5 seconds. Pressing the shutter button again during capture cancels the recording.
 
 ### Gallery controls
 - Center joystick button opens the gallery.
