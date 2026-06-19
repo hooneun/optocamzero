@@ -10,7 +10,33 @@ from flask import Flask, send_from_directory, render_template_string, Response, 
 
 PHOTOS_DIR = "/home/dkumkum/photos"
 
+MEDIA_EXTS = (".jpg", ".gif")
+
 app = Flask(__name__)
+
+
+def capture_number_of(filename):
+    """Numeric id from Optocamzero_<n>.<ext>, or None. Shared ordering across
+    photos (.jpg) and GIFs (.gif)."""
+    if not filename.startswith("Optocamzero_"):
+        return None
+    stem = filename[len("Optocamzero_"):]
+    dot = stem.rfind(".")
+    if dot == -1:
+        return None
+    num, ext = stem[:dot], stem[dot:].lower()
+    if ext in MEDIA_EXTS and num.isdigit():
+        return int(num)
+    return None
+
+
+def list_media():
+    """All media files (photos + GIFs) newest-first."""
+    if not os.path.exists(PHOTOS_DIR):
+        return []
+    files = [f for f in os.listdir(PHOTOS_DIR) if capture_number_of(f) is not None]
+    files.sort(key=lambda f: capture_number_of(f), reverse=True)
+    return files
 
 HTML = """<!DOCTYPE html>
 <html>
@@ -148,6 +174,24 @@ header {
     z-index: 2;
 }
 .dl-icon svg { width: 13px; height: 13px; }
+.gif-badge {
+    position: absolute;
+    bottom: 7px;
+    left: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 8px 2px;        /* extra top padding nudges the text down */
+    font-family: 'CamFont', monospace;
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: #fff;
+    background: rgba(0,0,0,0.6);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 999px;        /* fully rounded ends → pill */
+    z-index: 2;
+    pointer-events: none;
+}
 
 /* ── Viewer ── */
 #viewer {
@@ -427,6 +471,7 @@ header {
       <button class="img-btn" onclick="openViewer({{ loop.index0 }})">
         <img src="/thumb/{{ f }}" loading="lazy" alt="{{ f }}">
       </button>
+      {% if f.lower().endswith('.gif') %}<span class="gif-badge">GIF</span>{% endif %}
       <button class="sel-circle" onclick="toggleSel(event, this)"></button>
       <a class="dl-icon" href="/photo/{{ f }}" download="{{ f }}" onclick="event.stopPropagation()">
         <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
@@ -508,9 +553,12 @@ header {
 
 <script>
 const files = {{ files_json | safe }};
+const gifs = new Set({{ gifs_json | safe }});
 const selected = new Set();
 let viewerIdx = 0;
 let hqMode = false;
+
+function isGif(f) { return gifs.has(f); }
 
 
 function toggleSel(e, circle) {
@@ -556,6 +604,7 @@ function closeViewer() {
 }
 
 function toggleHQ() {
+    if (isGif(files[viewerIdx])) return;   // GIFs have no HQ variant
     hqMode = !hqMode;
     document.getElementById('viewer-hq').classList.toggle('active', hqMode);
     const img = document.getElementById('viewer-img');
@@ -570,9 +619,12 @@ function updateViewer() {
     const img = document.getElementById('viewer-img');
     const spinner = document.getElementById('spinner');
     const f = files[viewerIdx];
+    const gif = isGif(f);
     img.style.display = 'none';
     spinner.classList.add('active');
-    img.src = hqMode ? '/photo/' + f : '/thumb/' + f + '?size=1200';
+    // GIFs always play their full animated original; photos use the sized thumb / HQ
+    img.src = gif ? '/thumb/' + f : (hqMode ? '/photo/' + f : '/thumb/' + f + '?size=1200');
+    document.getElementById('viewer-hq').style.display = gif ? 'none' : 'flex';
     document.getElementById('viewer-pos').textContent = (viewerIdx + 1) + ' / ' + files.length;
     document.getElementById('viewer-filename').textContent = f;
     const dl = document.getElementById('viewer-dl');
@@ -770,17 +822,12 @@ def get_free_space():
 
 @app.route("/")
 def index():
-    if os.path.exists(PHOTOS_DIR):
-        files = sorted(
-            [f for f in os.listdir(PHOTOS_DIR) if f.lower().endswith(".jpg")],
-            key=lambda f: int(f[len("Optocamzero_"):-len(".jpg")]) if f.startswith("Optocamzero_") and f[len("Optocamzero_"):-len(".jpg")].isdigit() else 0,
-            reverse=True
-        )
-    else:
-        files = []
+    files = list_media()
+    gif_set = [f for f in files if f.lower().endswith(".gif")]
     return render_template_string(
         HTML, files=files, count=len(files),
-        free_space=get_free_space(), files_json=json.dumps(files)
+        free_space=get_free_space(),
+        files_json=json.dumps(files), gifs_json=json.dumps(gif_set)
     )
 
 
@@ -810,6 +857,10 @@ def thumb(filename):
     path = os.path.join(PHOTOS_DIR, filename)
     if not os.path.exists(path):
         return "Not found", 404
+    # GIFs are served inline as-is so they animate in the grid and viewer —
+    # resizing would flatten them to a single frame.
+    if filename.lower().endswith(".gif"):
+        return send_from_directory(PHOTOS_DIR, filename, mimetype="image/gif")
     size = min(request.args.get('size', 400, type=int), 1200)
     cache_path = get_thumb_path(filename, size)
     if not os.path.exists(cache_path) or os.path.getsize(cache_path) == 0:
@@ -837,11 +888,8 @@ def preload():
     def generate_all():
         if not os.path.exists(PHOTOS_DIR):
             return
-        files = sorted(
-            [f for f in os.listdir(PHOTOS_DIR) if f.lower().endswith(".jpg")],
-            key=lambda f: int(f[len("Optocamzero_"):-len(".jpg")]) if f.startswith("Optocamzero_") and f[len("Optocamzero_"):-len(".jpg")].isdigit() else 0,
-            reverse=True
-        )[:10]  # preload 10 most recent on page load
+        # Only photos get pre-generated thumbnails; GIFs are served as-is.
+        files = [f for f in list_media() if f.lower().endswith(".jpg")][:10]
         for filename in files:
             cache_path = get_thumb_path(filename, 1200)
             if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
@@ -866,7 +914,7 @@ def preload_ahead():
     import threading
     from PIL import Image as PILImage
     data = request.get_json()
-    filenames = data.get("files", [])
+    filenames = [f for f in data.get("files", []) if not f.lower().endswith(".gif")]
     def generate():
         for filename in filenames:
             cache_path = get_thumb_path(filename, 1200)

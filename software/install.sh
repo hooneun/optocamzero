@@ -114,7 +114,7 @@ add_if_missing "disable_overscan=1"
 # Boot parameters
 CMDLINE=/boot/firmware/cmdline.txt
 if ! grep -q "spidev.bufsiz" "$CMDLINE"; then
-    sed -i 's/$/ spidev.bufsiz=65536/' "$CMDLINE"
+    sed -i 's/$/ spidev.bufsiz=131072/' "$CMDLINE"
 fi
 if ! grep -q "quiet" "$CMDLINE"; then
     sed -i 's/$/ quiet loglevel=3 logo.nologo vt.global_cursor_default=0/' "$CMDLINE"

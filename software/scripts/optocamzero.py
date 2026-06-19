@@ -52,7 +52,9 @@ GPIO.setup(DC_PIN, GPIO.OUT)
 GPIO.setup(BL_PIN, GPIO.OUT)
 _pi = pigpio.pi()
 _pi.set_PWM_frequency(BL_PIN, 1000)
-_pi.set_PWM_dutycycle(BL_PIN, 255)
+# Keep the backlight OFF until the splash is actually drawn — otherwise it lights
+# the uninitialised (white) panel for ~2s during boot before the splash appears.
+_pi.set_PWM_dutycycle(BL_PIN, 0)
 GPIO.setup(BUTTON_PREVIEW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(BUTTON_CAPTURE, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(JOYSTICK_LEFT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -78,20 +80,44 @@ class CameraConfigCache:
             queue=False,
             controls={"AfMode": 2, "AfSpeed": 1, "FrameDurationLimits": (100, 25000)}
         )
-        self.capture_config = picam2.create_still_configuration(
-            main={"size": (2592, 2592), "format": "RGB888"},
-            buffer_count=2
-        )
+        self._picam2 = picam2
+        self.capture_config = None
+        self.gif_config = None
+
+    def get_capture_config(self):
+        if self.capture_config is None:
+            self.capture_config = self._picam2.create_still_configuration(
+                main={"size": (2592, 2592), "format": "RGB888"},
+                buffer_count=2
+            )
+        return self.capture_config
+
+    def get_gif_config(self):
+        # 640x640 stream used only while recording a GIF. Built lazily so it
+        # never costs anything until the first recording. Continuous AF, frame
+        # duration capped so live frames keep flowing during the countdown.
+        if self.gif_config is None:
+            self.gif_config = self._picam2.create_preview_configuration(
+                main={"size": (640, 640), "format": "RGB888"},
+                buffer_count=4,
+                controls={"AfMode": 2, "AfSpeed": 1, "FrameDurationLimits": (33333, 100000)}
+            )
+        return self.gif_config
 config_cache = None
 FONT_PATH = "/home/dkumkum/cmunvt.ttf"
 
 # Shadow cache for preview overlays — only regenerated when value changes
 _shadow_cache = {}
 
+# Fully-assembled HUD overlay cache — keyed on the values that define it, so a
+# steady scene reuses the composited shadow layer instead of rebuilding it
+# (skips ~4 full-frame alpha_composites per preview frame).
+_hud_overlay_cache = {"key": None, "img": None}
+
 def make_text_shadow(text, x, y, font):
     from PIL import ImageDraw, ImageFilter
     shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).text((x, y), text, font=font, fill=(0, 0, 0, 200))
+    ImageDraw.Draw(shadow).text((x, y), text, font=font, fill=(0, 0, 0, 250))
     return shadow.filter(ImageFilter.GaussianBlur(radius=4))
 
 _STANDARD_ISO = [100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600]
@@ -130,6 +156,124 @@ def get_cached_shadow(key, text, x, y, font):
         _shadow_cache[key + "_img"] = make_text_shadow(text, x, y, font)
     return _shadow_cache[key + "_img"]
 
+# ── Animated centre labels (filter name, "GIF Mode", toasts) ────────────────
+# Each label is rendered once into a cached sprite (blurred shadow + white text),
+# then composited every frame with an eased fade + slight scale "pop". Kept
+# separate from the cached static HUD overlay so it animates without invalidating
+# that cache — steady-state cost is unchanged; the extra work only runs while a
+# label is on screen.
+_centre_msg_sprite_cache = {}
+
+def get_centre_msg_sprite(text):
+    if text in _centre_msg_sprite_cache:
+        return _centre_msg_sprite_cache[text]
+    from PIL import ImageDraw, ImageFilter
+    font = load_font(25)
+    shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    white  = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    wd = ImageDraw.Draw(white)
+    b = wd.textbbox((0, 0), text, font=font)
+    mx = (240 - (b[2] - b[0])) // 2 - b[0]
+    my = (240 - (b[3] - b[1])) // 2 - b[1]
+    ImageDraw.Draw(shadow).text((mx, my), text, font=font, fill=(0, 0, 0, 250))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
+    wd.text((mx, my), text, font=font, fill=(255, 255, 255, 255))
+    sprite = Image.alpha_composite(shadow, white)
+    _centre_msg_sprite_cache[text] = sprite
+    return sprite
+
+def _ease_out_back(t, c1=1.9):
+    """Ease-out with an overshoot past 1.0 — the bounce (bigger c1 = more bounce)."""
+    c3 = c1 + 1
+    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+def _ease_centre_msg(age, dur):
+    """(alpha, scale): short fade in/out; scale matches the original version —
+    a gentle 0.80→1.0 ease-out, no overshoot."""
+    A_IN, A_OUT, S_IN = 0.12, 0.18, 0.18
+    if age < A_IN:
+        alpha = 1 - (1 - age / A_IN) ** 3
+    elif age > dur - A_OUT:
+        t = max(0.0, (dur - age) / A_OUT)
+        alpha = t * t
+    else:
+        alpha = 1.0
+    if age < S_IN:
+        t = age / S_IN
+        scale = 0.80 + 0.20 * (1 - (1 - t) ** 3)
+    else:
+        scale = 1.0
+    return alpha, scale
+
+def render_centre_msg(base_rgb, text, age, dur):
+    """Composite the centre label with a short fade + a scale bounce."""
+    a, s = _ease_centre_msg(age, dur)
+    sprite = get_centre_msg_sprite(text)
+    if abs(s - 1.0) > 0.005:                # handles both shrink (<1) and overshoot (>1)
+        sw = max(1, int(240 * s))
+        small = sprite.resize((sw, sw), Image.BILINEAR)
+        sprite2 = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+        off = (240 - sw) // 2
+        sprite2.paste(small, (off, off))
+        sprite = sprite2
+    if a < 0.999:
+        faded = sprite.copy()
+        faded.putalpha(sprite.getchannel("A").point(lambda p: int(p * a)))
+        sprite = faded
+    return Image.alpha_composite(base_rgb.convert("RGBA"), sprite).convert("RGB")
+
+# Filter pill: the slightest bounce when the filter changes (subtle overshoot,
+# no opacity change). Pulled out of the cached overlay only while popping.
+PILL_POP_DUR = 0.30
+
+def _pill_pop_scale(age):
+    t = min(1.0, max(0.0, age / PILL_POP_DUR))
+    return 0.90 + 0.10 * _ease_out_back(t)        # 0.90 → ~1.01 → 1.0 (very subtle)
+
+def render_pill_pop(base_rgb, indicator, scale):
+    """Composite the filter indicator scaled around its own centre."""
+    bbox = indicator.getbbox()
+    if bbox is None or abs(scale - 1.0) < 0.005:
+        return Image.alpha_composite(base_rgb.convert("RGBA"), indicator).convert("RGB")
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    sw = max(1, int(240 * scale))
+    resized = indicator.resize((sw, sw), Image.BILINEAR)
+    canvas = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    canvas.paste(resized, (int(round(cx * (1 - scale))), int(round(cy * (1 - scale)))))
+    return Image.alpha_composite(base_rgb.convert("RGBA"), canvas).convert("RGB")
+
+# AWB label sprite (top-left) — cached per (text, font size). Reused by the
+# white-balance transition: the label scale-pops whenever its text changes,
+# i.e. on an AWB change and again when the full name collapses to the abbrev.
+_awb_sprite_cache = {}
+AWB_POP_DUR = 0.30      # gentle, matches the filter pill
+
+def get_awb_sprite(text, font_size):
+    key = (text, font_size)
+    if key in _awb_sprite_cache:
+        return _awb_sprite_cache[key]
+    from PIL import ImageDraw, ImageFilter
+    font = load_font(font_size)
+    shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    white  = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    wd = ImageDraw.Draw(white)
+    b = wd.textbbox((0, 0), text, font=font)
+    ax, ay = 15, 15 - b[1]
+    ImageDraw.Draw(shadow).text((ax, ay), text, font=font, fill=(0, 0, 0, 250))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
+    wd.text((ax, ay), text, font=font, fill=(255, 255, 255, 255))
+    sprite = Image.alpha_composite(shadow, white)
+    _awb_sprite_cache[key] = sprite
+    return sprite
+
+def _awb_pop_scale(age, full):
+    t = min(1.0, max(0.0, age / AWB_POP_DUR))
+    e = _ease_out_back(t)
+    if full:
+        return 0.94 + 0.06 * e     # long name: even more subtle
+    return 0.90 + 0.10 * e         # abbreviation: gentle, like the filter pill
+
 # Filter indicator circle — cached per filter name, built once on first use
 _indicator_cache = {}
 
@@ -137,15 +281,21 @@ def get_filter_indicator(filter_name):
     if filter_name in _indicator_cache:
         return _indicator_cache[filter_name]
     from PIL import ImageDraw, ImageFilter
-    pad = 10
-    r   = 17
-    cx  = 240 - pad - r
+    # Rendered at SxS supersample then scaled down with LANCZOS so the circle /
+    # pill outline is anti-aliased. Cached per filter, so this runs once per
+    # filter — the preview loop only ever composites the finished 240px layer,
+    # so there is no per-frame cost and the fps is unchanged.
+    S   = 3
+    big = 240 * S
+    pad = 10 * S
+    r   = 17 * S
+    cx  = big - pad - r
     cy  = pad + r
-    font = load_font(24)
+    font = load_font(24 * S)
 
     # Build shadow and white layers separately, then composite — same approach as HUD text
-    shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
-    white  = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    white  = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow)
     wd = ImageDraw.Draw(white)
 
@@ -155,19 +305,19 @@ def get_filter_indicator(filter_name):
     if filter_name in _PILL_LABELS:
         label  = _PILL_LABELS[filter_name]
         tb     = wd.textbbox((0, 0), label, font=font)
-        h_pad  = 10
+        h_pad  = 10 * S
         pill_h = r * 2
         pill_w = (tb[2] - tb[0]) + h_pad * 2
-        x1, y0 = 240 - pad, pad
+        x1, y0 = big - pad, pad
         x0, y1 = x1 - pill_w, y0 + pill_h
         cr  = pill_h // 2
         pcx = (x0 + x1) // 2
         pcy = (y0 + y1) // 2
         tx  = pcx - (tb[0] + tb[2]) // 2
         ty  = pcy - (tb[1] + tb[3]) // 2
-        sd.rounded_rectangle([x0, y0, x1, y1], radius=cr, outline=(0, 0, 0, 200), width=2)
-        sd.text((tx, ty), label, font=font, fill=(0, 0, 0, 200))
-        wd.rounded_rectangle([x0, y0, x1, y1], radius=cr, outline=(255, 255, 255, 255), width=1)
+        sd.rounded_rectangle([x0, y0, x1, y1], radius=cr, outline=(0, 0, 0, 250), width=2 * S)
+        sd.text((tx, ty), label, font=font, fill=(0, 0, 0, 250))
+        wd.rounded_rectangle([x0, y0, x1, y1], radius=cr, outline=(255, 255, 255, 255), width=1 * S)
         wd.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
     else:
         label = filter_name[0]
@@ -175,26 +325,118 @@ def get_filter_indicator(filter_name):
         tx = cx - (tb[0] + tb[2]) // 2
         ty = cy - (tb[1] + tb[3]) // 2
         if label in ("D", "P", "L", "N"):
-            tx += 1
-        sd.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(0, 0, 0, 200), width=2)
-        sd.text((tx, ty), label, font=font, fill=(0, 0, 0, 200))
-        wd.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(255, 255, 255, 255), width=1)
+            tx += S
+        sd.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(0, 0, 0, 250), width=2 * S)
+        sd.text((tx, ty), label, font=font, fill=(0, 0, 0, 250))
+        wd.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(255, 255, 255, 255), width=1 * S)
         wd.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
 
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
-    layer  = Image.alpha_composite(shadow, white)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4 * S))
+    layer  = Image.alpha_composite(shadow, white).resize((240, 240), Image.LANCZOS)
     _indicator_cache[filter_name] = layer
     return layer
 
+# "GIF" badge shown while GIF mode is armed, with a marching-dashes outline.
+# A small set of phase variants is pre-rendered once (each with its own blur),
+# then cycled per frame — so the animation costs nothing extra at draw time.
+_GIF_PILL_PHASES   = 2     # number of pre-rendered dash offsets (one loop)
+_GIF_PILL_MARCH_HZ = 4     # phases advanced per second → marching speed
+_gif_indicator_phases = None
+
+def _trace_capsule_perimeter(x0, y0, x1, y1, cr, step=1.5):
+    """Ordered points around a horizontal capsule (pill) perimeter, used to lay
+    dashes along the outline."""
+    import math
+    pts = []
+    xa, xb = x0 + cr, x1 - cr
+    cyc = y0 + cr
+    d = xa                                   # top edge, left → right
+    while d <= xb:
+        pts.append((d, y0)); d += step
+    a = -math.pi / 2                         # right end semicircle
+    while a <= math.pi / 2:
+        pts.append((xb + cr * math.cos(a), cyc + cr * math.sin(a))); a += step / cr
+    d = xb                                   # bottom edge, right → left
+    while d >= xa:
+        pts.append((d, y1)); d -= step
+    a = math.pi / 2                          # left end semicircle
+    while a <= 3 * math.pi / 2:
+        pts.append((xa + cr * math.cos(a), cyc + cr * math.sin(a))); a += step / cr
+    return pts
+
+def _draw_dashed_path(draw, pts, phase, dash, gap, width, fill):
+    """Draw a dashed line along an ordered, closed list of points. `phase` shifts
+    the dash pattern along the path (marching ants)."""
+    import math
+    period = dash + gap
+    acc = 0.0
+    for p, q in zip(pts, pts[1:] + pts[:1]):
+        if ((acc + phase) % period) < dash:
+            draw.line([p, q], fill=fill, width=width)
+        acc += math.hypot(q[0] - p[0], q[1] - p[1])
+
+def _build_gif_indicator_phases():
+    # Rendered at SxS supersample then scaled down with LANCZOS so the dashes
+    # come out smooth and anti-aliased instead of jagged. One-time cost.
+    from PIL import ImageDraw, ImageFilter
+    S   = 3
+    big = 240 * S
+    font = load_font(24 * S)
+    label = "GIF"
+    tmp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    tb = tmp.textbbox((0, 0), label, font=font)
+    # Sits directly under the filter pill (top-right), sharing its right edge.
+    pad    = 10 * S
+    pill_h = 34 * S
+    pill_w = (tb[2] - tb[0]) + 20 * S
+    x1 = big - pad
+    x0 = x1 - pill_w
+    y0 = pad + pill_h + 8 * S
+    y1 = y0 + pill_h
+    cr = pill_h // 2
+    tx = x0 + (pill_w - (tb[0] + tb[2])) // 2
+    ty = y0 + (pill_h - (tb[1] + tb[3])) // 2
+    pts = _trace_capsule_perimeter(x0, y0, x1, y1, cr, step=2.0)
+    dash, gap = 6 * S, 5 * S
+    period = dash + gap
+    layers = []
+    for k in range(_GIF_PILL_PHASES):
+        phase = period * k / _GIF_PILL_PHASES   # full pattern shift over one loop
+        shadow = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        white  = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shadow)
+        wd = ImageDraw.Draw(white)
+        _draw_dashed_path(sd, pts, phase, dash, gap, 3 * S, (0, 0, 0, 250))
+        _draw_dashed_path(wd, pts, phase, dash, gap, 2 * S, (255, 255, 255, 255))
+        sd.text((tx, ty), label, font=font, fill=(0, 0, 0, 250))
+        wd.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4 * S))
+        layer = Image.alpha_composite(shadow, white).resize((240, 240), Image.LANCZOS)
+        layers.append(layer)
+    return layers
+
+def get_gif_mode_indicator(phase_index=0):
+    global _gif_indicator_phases
+    if _gif_indicator_phases is None:
+        _gif_indicator_phases = _build_gif_indicator_phases()
+    return _gif_indicator_phases[phase_index % _GIF_PILL_PHASES]
+
 _font_cache = {}  # v2: cache loaded fonts so TTF isn't re-opened every frame
+_font_warned = False
 def load_font(size):
+    global _font_warned
     if size in _font_cache:
         return _font_cache[size]
+    from PIL import ImageFont
     try:
-        from PIL import ImageFont
         _font_cache[size] = ImageFont.truetype(FONT_PATH, size)
-    except:
-        from PIL import ImageFont
+    except (OSError, IOError) as e:
+        # Bitmap default has no TTF dependency and will always load; surface
+        # the reason once so silent fallbacks don't hide misconfiguration
+        # (e.g. Pillow built without freetype, or the TTF missing on disk).
+        if not _font_warned:
+            log(f"TTF load failed ({FONT_PATH}): {e!r} — using bitmap default")
+            _font_warned = True
         _font_cache[size] = ImageFont.load_default()
     return _font_cache[size]
 
@@ -376,7 +618,10 @@ def send_command(cmd):
     spi.xfer([cmd])
 def send_data(data):
     GPIO.output(DC_PIN, GPIO.HIGH)
-    chunk_size = 65536  # v2: larger chunks = fewer SPI transactions = less tearing
+    # v3: one transfer for a whole 240x240x2 (115200B) frame instead of ~29
+    # fragmented 4KB transfers — far less tearing. Requires spidev.bufsiz to be
+    # raised in cmdline.txt (default 4096) so the kernel doesn't split it.
+    chunk_size = 131072
     for i in range(0, len(data), chunk_size):
         chunk = data[i:i + chunk_size]
         try:
@@ -438,14 +683,18 @@ _CONTRAST_LUT = np.clip(
     0, 255
 ).astype(np.uint8)
 
+# v3: fold the contrast curve AND the RGB565 mask/shift into three per-channel
+# uint16 LUTs, so each frame is three lookups + two ORs instead of a contrast
+# gather followed by uint16 masking/shifting. Bit-identical output, ~30% faster.
+_c16 = _CONTRAST_LUT.astype(np.uint16)
+_R565_LUT = ((_c16 & 0xF8) << 8).astype(np.uint16)
+_G565_LUT = ((_c16 & 0xFC) << 3).astype(np.uint16)
+_B565_LUT = ((_c16 & 0xF8) >> 3).astype(np.uint16)
+
 def convert_to_rgb565(image):
-    """RGB565 conversion with enhanced contrast"""
-    rgb_array = np.frombuffer(image.tobytes(), dtype=np.uint8).reshape((240, 240, 3))
-    rgb_array = _CONTRAST_LUT[rgb_array]  # v2: LUT lookup, no float32 intermediate
-    r = rgb_array[:, :, 0].astype(np.uint16) & 0xF8
-    g = rgb_array[:, :, 1].astype(np.uint16) & 0xFC
-    b = rgb_array[:, :, 2].astype(np.uint16) & 0xF8
-    rgb565 = (r << 8) | (g << 3) | (b >> 3)
+    """RGB565 conversion with enhanced contrast, via fused per-channel LUTs."""
+    a = np.asarray(image, dtype=np.uint8)
+    rgb565 = _R565_LUT[a[:, :, 0]] | _G565_LUT[a[:, :, 1]] | _B565_LUT[a[:, :, 2]]
     return rgb565.astype('>u2').tobytes()
 def display_image(image):
     with display_lock:
@@ -560,18 +809,32 @@ GALLERY_DIR = "/home/dkumkum/photos"
 _capture_counter = None
 _capture_counter_lock = threading.Lock()
 
+def _capture_number_of(filename):
+    """Extract the numeric id from an Optocamzero_<n>.<ext> name, or None."""
+    if not filename.startswith("Optocamzero_"):
+        return None
+    stem = filename[len("Optocamzero_"):]
+    dot = stem.rfind(".")
+    if dot == -1:
+        return None
+    num = stem[:dot]
+    ext = stem[dot:].lower()
+    if ext in (".jpg", ".gif") and num.isdigit():
+        return int(num)
+    return None
+
 def get_next_capture_number():
     """Return next available number using an in-memory counter.
-    Scans filesystem only once on first call — rapid shots never collide."""
+    Scans filesystem only once on first call — rapid shots never collide.
+    Numbering is shared across photos (.jpg) and GIFs (.gif) so ids never
+    collide between the two media types."""
     global _capture_counter
     with _capture_counter_lock:
         if _capture_counter is None:
             try:
                 numbers = [
-                    int(f[len("Optocamzero_"):-len(".jpg")])
-                    for f in os.listdir(GALLERY_DIR)
-                    if f.startswith("Optocamzero_") and f.endswith(".jpg")
-                    and f[len("Optocamzero_"):-len(".jpg")].isdigit()
+                    n for f in os.listdir(GALLERY_DIR)
+                    if (n := _capture_number_of(f)) is not None
                 ] if os.path.exists(GALLERY_DIR) else []
                 _capture_counter = max(numbers) + 1 if numbers else 1
             except:
@@ -589,9 +852,9 @@ def get_gallery_images():
         files = [
             os.path.join(GALLERY_DIR, f)
             for f in os.listdir(GALLERY_DIR)
-            if f.startswith("Optocamzero_") and f.endswith(".jpg")
+            if _capture_number_of(f) is not None
         ]
-        files.sort(key=lambda f: int(os.path.basename(f)[len("Optocamzero_"):-len(".jpg")]))
+        files.sort(key=lambda f: _capture_number_of(os.path.basename(f)))
         print(f"Found {len(files)} images")
         return files
     except Exception as e:
@@ -614,7 +877,7 @@ def display_gallery_image(filepath, index, total, confirm_delete=False):
         text_h = bbox_t[3] - bbox_t[1]
         x, y = 15, 240 - 15 - text_h
         shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).text((x, y), text, font=font, fill=(0, 0, 0, 200))
+        ImageDraw.Draw(shadow).text((x, y), text, font=font, fill=(0, 0, 0, 250))
         shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
         img = img.convert("RGBA")
         img = Image.alpha_composite(img, shadow)
@@ -655,6 +918,89 @@ def display_gallery_image(filepath, index, total, confirm_delete=False):
         display_image(img)
     except Exception as e:
         print(f"Gallery load error: {e}")
+
+def _build_gif_static_overlay(index, total):
+    """Pre-blurred RGBA overlay (240x240) shared by every frame of a GIF: the
+    'GIF' label (top-left) and the position counter (bottom-left). Built once so
+    the expensive GaussianBlur runs a single time per GIF instead of per frame."""
+    from PIL import ImageDraw, ImageFilter
+    font_lbl = load_font(25)
+    shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    white  = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    wd = ImageDraw.Draw(white)
+
+    # "GIF" — top-left
+    bl = wd.textbbox((0, 0), "GIF", font=font_lbl)
+    lx, ly = 15, 15 - bl[1]
+    sd.text((lx, ly), "GIF", font=font_lbl, fill=(0, 0, 0, 250))
+    wd.text((lx, ly), "GIF", font=font_lbl, fill=(255, 255, 255, 255))
+
+    # position counter — bottom-left
+    pos = f"{index}/{total}"
+    bp = wd.textbbox((0, 0), pos, font=font_lbl)
+    px, py = 15, 240 - 15 - (bp[3] - bp[1])
+    sd.text((px, py), pos, font=font_lbl, fill=(0, 0, 0, 250))
+    wd.text((px, py), pos, font=font_lbl, fill=(255, 255, 255, 255))
+
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
+    return Image.alpha_composite(shadow, white)
+
+def _overlay_gif_frame(rgb_frame, static, font_fc, i, n):
+    """Composite the shared static overlay + the per-frame counter (top-right)
+    onto one already-resized 240x240 RGB frame."""
+    from PIL import ImageDraw
+    f = Image.alpha_composite(rgb_frame.convert("RGBA"), static).convert("RGB")
+    # Frame counter — cheap offset shadow (dark grey, not pure black, so it
+    # blends with the blurred shadows on the other labels)
+    fc = f"{i+1}/{n}"
+    d = ImageDraw.Draw(f)
+    b = d.textbbox((0, 0), fc, font=font_fc)
+    x, y = 240 - 15 - b[2], 15 - b[1]
+    d.text((x + 1, y + 1), fc, font=font_fc, fill=(60, 60, 60))
+    d.text((x, y), fc, font=font_fc, fill=(255, 255, 255))
+    return f
+
+# Incremented on every gallery navigation; a background decode thread bails out
+# as soon as its token is stale (i.e. the user moved to another image).
+_gif_load_token = 0
+
+def start_gif_gallery_load(filepath, index, total):
+    """Decode and overlay frame 0 synchronously (fast — one frame), then decode
+    the rest in a background thread, appending into the SAME returned list so the
+    gallery can start playing immediately instead of stalling ~0.8s on the whole
+    GIF. Returns the frames list (with frame 0 already in it)."""
+    global _gif_load_token
+    _gif_load_token += 1
+    token = _gif_load_token
+    frames = []
+    try:
+        gif = Image.open(filepath)
+        n = getattr(gif, "n_frames", 1)
+        static = _build_gif_static_overlay(index, total)
+        font_fc = load_font(22)
+        gif.seek(0)
+        frames.append(_overlay_gif_frame(
+            gif.convert("RGB").resize((240, 240), Image.BILINEAR), static, font_fc, 0, n))
+
+        def decode_rest():
+            try:
+                g = Image.open(filepath)
+                for i in range(1, n):
+                    if token != _gif_load_token:
+                        return   # user navigated away — stop wasting work
+                    g.seek(i)
+                    frames.append(_overlay_gif_frame(
+                        g.convert("RGB").resize((240, 240), Image.BILINEAR), static, font_fc, i, n))
+            except Exception as e:
+                print(f"GIF bg decode error: {e}")
+
+        if n > 1:
+            threading.Thread(target=decode_rest, daemon=True).start()
+    except Exception as e:
+        print(f"GIF gallery load error: {e}")
+    return frames
+
 def _save_image_async(captured_image, filepath, filename, film_name="No Filter"):
     """Save and verify image in background — runs after preview has already resumed"""
     global saving_active
@@ -723,18 +1069,22 @@ def capture_full_res(picam2):
             if camera_started:
                 picam2.stop()
                 camera_started = False
-                time.sleep(0.05)
+                time.sleep(0.02)
 
-            # Configure and start capture
-            picam2.configure(config_cache.capture_config)
+            # Configure and start capture. The AF loop below polls real frames,
+            # so it doubles as the settle — no long fixed sleep needed here.
+            picam2.configure(config_cache.get_capture_config())
             picam2.start()
-            time.sleep(0.12)
+            time.sleep(0.05)
 
             # Autofocus
             picam2.set_controls({"AfMode": 1, "AfTrigger": 0})
             focus_start = time.time()
             focused = False
-            while time.time() - focus_start < 1.0:
+            # Capped at 0.5s: continuous AF in preview already keeps the lens
+            # focused, so a normal lock is ~0.17s; this stops an occasional
+            # hunt from freezing the preview for a full second.
+            while time.time() - focus_start < 0.5:
                 try:
                     metadata = picam2.capture_metadata()
                     af_state = metadata.get("AfState", 0)
@@ -765,9 +1115,8 @@ def capture_full_res(picam2):
                     captured_image = None
                     time.sleep(0.08)
 
-            time.sleep(0.05)
             picam2.stop()
-            time.sleep(0.05)
+            time.sleep(0.02)
 
             if captured_image is None:
                 print("✗ Capture failed")
@@ -797,6 +1146,228 @@ def capture_full_res(picam2):
         traceback.print_exc()
         capturing = False
         return None
+
+# ── GIF recording ───────────────────────────────────────────────────────────
+GIF_FRAMES   = 10     # total frames in the GIF
+GIF_FPS      = 2      # frames captured per second
+GIF_DURATION = 5      # seconds of recording (GIF_FRAMES / GIF_FPS)
+GIF_FRAME_MS = 1000 // GIF_FPS   # per-frame display duration in the saved GIF
+
+def _save_gif_async(frames, filepath, filename):
+    """Quantise frames to a single shared palette and encode the GIF in the
+    background — runs after recording has ended and preview has resumed."""
+    global saving_active
+    try:
+        start = time.time()
+        # One adaptive palette built from the first frame, applied to every
+        # frame with no dithering — keeps colours stable so the GIF doesn't
+        # flicker between frames the way per-frame quantisation would.
+        palette_src = frames[0].convert("P", palette=Image.ADAPTIVE, colors=256)
+        pal_frames = [
+            f.quantize(palette=palette_src, dither=Image.NONE) for f in frames
+        ]
+        pal_frames[0].save(
+            filepath, save_all=True, append_images=pal_frames[1:],
+            duration=GIF_FRAME_MS, loop=0, optimize=False, disposal=1,
+        )
+        with open(filepath, "rb") as f:
+            os.fsync(f.fileno())
+
+        if not os.path.exists(filepath) or os.path.getsize(filepath) < 1000:
+            print("✗ GIF too small / not created - DELETING")
+            try:
+                os.remove(filepath)
+            except:
+                pass
+            return
+
+        file_size = os.path.getsize(filepath)
+        print(f"✓ Saved {filename} ({file_size/1024:.0f} KB) in {time.time()-start:.2f}s")
+    except Exception as e:
+        print(f"✗ GIF save error: {e}")
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except:
+            pass
+    finally:
+        with _save_active_lock:
+            saving_active -= 1
+
+# Countdown sprites (shadow + white number) cached per value so the blur runs
+# once per number instead of on every recording frame.
+_rec_num_cache = {}
+
+def _get_rec_number_layer(num):
+    if num in _rec_num_cache:
+        return _rec_num_cache[num]
+    from PIL import ImageDraw, ImageFilter
+    font_num = load_font(49)
+    shadow = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    white  = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+    wd = ImageDraw.Draw(white)
+    b = wd.textbbox((0, 0), num, font=font_num)
+    nx = (240 - (b[2] - b[0])) // 2 - b[0]
+    ny = (240 - (b[3] - b[1])) // 2 - b[1]
+    ImageDraw.Draw(shadow).text((nx, ny), num, font=font_num, fill=(0, 0, 0, 250))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=5))
+    wd.text((nx, ny), num, font=font_num, fill=(255, 255, 255, 255))
+    layer = Image.alpha_composite(shadow, white)
+    _rec_num_cache[num] = layer
+    return layer
+
+def _draw_rec_overlay(image, count, age=1.0):
+    """Pulsing red recording border + countdown number (cached sprite) on a
+    240x240 frame. `age` is seconds since the number last changed — the number
+    scales in (0.7→1.0 ease-out) so each step pops."""
+    from PIL import ImageDraw
+    img = image.convert("RGBA")
+
+    # Static red recording border (no motion)
+    ImageDraw.Draw(img).rectangle([0, 0, 239, 239], outline=(235, 45, 45), width=3)
+
+    # Countdown number — very slight scale pop on each change
+    layer = _get_rec_number_layer(str(count))
+    if age < 0.13:
+        t = age / 0.13
+        s = 0.95 + 0.05 * (1 - (1 - t) ** 3)
+        sw = max(1, int(240 * s))
+        small = layer.resize((sw, sw), Image.BILINEAR)
+        layer = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+        off = (240 - sw) // 2
+        layer.paste(small, (off, off))
+
+    img = Image.alpha_composite(img, layer)
+    return img.convert("RGB")
+
+def record_gif(picam2):
+    """Record a 640x640 GIF: GIF_FRAMES frames at GIF_FPS over GIF_DURATION
+    seconds. Drives the display directly (live frame + countdown) for the whole
+    recording, then hands encoding to a background thread. Runs inline from the
+    main loop — preview is reconfigured to 640 for the duration, then restored."""
+    global capturing, camera_started, config_cache, saving_active, gif_recording, gif_cancel_requested
+
+    frames = []
+    film_name = FILTERS[filter_index]
+    filepath = None
+    filename = None
+    cancelled = False
+
+    try:
+        with camera_lock:
+            gif_recording = True
+            gif_cancel_requested = False
+            print("\n=== GIF RECORD ===")
+
+            os.makedirs(GALLERY_DIR, exist_ok=True)
+            number = get_next_capture_number()
+            filename = f"Optocamzero_{number}.gif"
+            filepath = os.path.join(GALLERY_DIR, filename)
+
+            # Switch to the 640 stream
+            if camera_started:
+                picam2.stop()
+                camera_started = False
+                time.sleep(0.05)
+            picam2.configure(config_cache.get_gif_config())
+            picam2.start()
+            # Reconfiguring resets the ISP — re-apply the active filter's
+            # saturation/contrast and the current white balance so both the live
+            # view and the saved frames match normal preview (e.g. B&W stays B&W).
+            picam2.set_controls({**_FILM_ISP[film_name],
+                                 "AwbMode": AWB_MODES[awb_mode_index][0]})
+            time.sleep(0.15)
+
+            # Track when the counter label last changed so each step can pop.
+            rec_label = None
+            rec_label_start = 0.0
+
+            # Brief pre-roll holding on the "1/10" mark so the counter registers
+            # before the first frame is grabbed.
+            preroll_end = time.time() + 0.3
+            while time.time() < preroll_end:
+                if gif_cancel_requested:
+                    cancelled = True
+                    break
+                try:
+                    req = picam2.capture_request()
+                    frame = req.make_image("main")
+                    req.release()
+                    disp = frame.transpose(Image.ROTATE_90).resize((240, 240), Image.BILINEAR)
+                    disp = _apply_filter_by_name(disp, film_name, apply_grain=False)
+                    lbl = f"1/{GIF_FRAMES}"
+                    if lbl != rec_label:
+                        rec_label, rec_label_start = lbl, time.time()
+                    display_image(_draw_rec_overlay(disp, lbl, time.time() - rec_label_start))
+                except Exception:
+                    pass
+                time.sleep(0.01)
+
+            interval = 1.0 / GIF_FPS
+            rec_start = time.time()
+            for i in range(GIF_FRAMES):
+                if cancelled:
+                    break
+                target = rec_start + i * interval
+                # Spin the live preview until this frame's capture time arrives
+                while True:
+                    if gif_cancel_requested:
+                        cancelled = True
+                        break
+                    now = time.time()
+                    frame_label = f"{i+1}/{GIF_FRAMES}"   # 1/10, 2/10, …
+                    try:
+                        req = picam2.capture_request()
+                        frame = req.make_image("main")
+                        req.release()
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        frame = frame.transpose(Image.ROTATE_90)
+                        # Live view: downscale, apply the active filter, add overlay
+                        disp = frame.resize((240, 240), Image.BILINEAR)
+                        disp = _apply_filter_by_name(disp, film_name, apply_grain=False)
+                        if frame_label != rec_label:
+                            rec_label, rec_label_start = frame_label, now
+                        display_image(_draw_rec_overlay(disp, frame_label, now - rec_label_start))
+                    if now >= target:
+                        break
+                    time.sleep(0.01)
+
+                # Capture the actual GIF frame at full 640, filter without grain
+                if not cancelled and frame is not None:
+                    gif_frame = _apply_filter_by_name(frame, film_name, apply_grain=False)
+                    frames.append(gif_frame)
+
+            picam2.stop()
+            time.sleep(0.05)
+
+        # === Camera lock released ===
+        if cancelled:
+            # Discard the in-process frames; nothing was ever written to disk.
+            frames = []
+            print("✗ GIF recording cancelled — discarded")
+        else:
+            print(f"✓ Captured {len(frames)} frames, encoding…")
+            if frames:
+                with _save_active_lock:
+                    saving_active += 1
+                threading.Thread(
+                    target=_save_gif_async,
+                    args=(frames, filepath, filename),
+                    daemon=True
+                ).start()
+
+    except Exception as e:
+        print(f"✗ GIF ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        gif_recording = False
+        gif_cancel_requested = False
+        # Force the main loop to rebuild the 240 preview cleanly
+        camera_started = False
+
 def button_handler():
     """Button and joystick polling"""
     global preview_active, capture_requested, exit_requested
@@ -805,6 +1376,7 @@ def button_handler():
     global filter_index, filter_label_time, isp_changed
     global transfer_mode, transfer_screen_shown, _transfer_last_activity, _transfer_dimmed
     global _idle_last_activity, _idle_dimmed
+    global gif_mode, gif_record_requested, gif_mode_label_time, gif_cancel_requested
 
     last_capture = 0
     last_preview = 0
@@ -812,6 +1384,12 @@ def button_handler():
     last_joy_up = 0
     last_joy_down = 0
     debounce = 0.3
+
+    # Capture button long-press → toggle GIF mode (suppresses the photo)
+    cap_was_down = False
+    cap_down_time = 0
+    cap_long_fired = False
+    CAP_LONG_THRESHOLD = 0.6
 
     left_held_since = 0
     right_held_since = 0
@@ -997,9 +1575,41 @@ def button_handler():
                 time.sleep(0.05)
                 continue
 
-            # --- Capture button ---
-            if not GPIO.input(BUTTON_CAPTURE):
-                if now - last_capture > debounce:
+            # --- Capture button: tap = photo / GIF record, long-press = toggle GIF mode ---
+            cap_is_down = not GPIO.input(BUTTON_CAPTURE)
+
+            # During a GIF recording, a shutter press cancels it (discards data)
+            if gif_recording:
+                if cap_is_down and not cap_was_down:
+                    gif_cancel_requested = True
+                    # Consume this press so the still-held button doesn't misfire
+                    # a long-press / capture once recording ends.
+                    cap_long_fired = True
+                    cap_down_time = now
+                    print("🚫 GIF cancel")
+                cap_was_down = cap_is_down
+
+            elif cap_is_down and not cap_was_down:
+                cap_was_down = True
+                cap_down_time = now
+                cap_long_fired = False
+
+            elif cap_is_down and cap_was_down:
+                # Held — fire GIF-mode toggle once at the threshold (live preview only)
+                if (not cap_long_fired and now - cap_down_time >= CAP_LONG_THRESHOLD
+                        and preview_active and not capturing and not gif_recording
+                        and not gallery_active):
+                    cap_long_fired = True
+                    gif_mode = not gif_mode
+                    gif_mode_label_time = now
+                    print(f"GIF mode {'ON' if gif_mode else 'OFF'}")
+
+            elif not cap_is_down and cap_was_down:
+                # Released — a long-press already acted on hold, so swallow it
+                cap_was_down = False
+                if cap_long_fired:
+                    last_capture = now
+                elif now - last_capture > debounce:
                     last_capture = now
                     if gallery_active:
                         if gallery_confirm_delete:
@@ -1009,7 +1619,7 @@ def button_handler():
                             gallery_active = False
                             preview_active = True
                             print("Gallery closed")
-                    elif preview_active and not capturing:
+                    elif preview_active and not capturing and not gif_recording:
                         try:
                             check_path = GALLERY_DIR if os.path.exists(GALLERY_DIR) else os.path.dirname(GALLERY_DIR)
                             stat = os.statvfs(check_path)
@@ -1017,12 +1627,19 @@ def button_handler():
                             if free_bytes < 20 * 1024 * 1024:
                                 no_space_message_time = time.time()
                                 print("✗ No space in card")
+                            elif gif_mode:
+                                gif_record_requested = True
+                                print("🎞 GIF RECORD")
                             else:
                                 capture_requested = True
                                 print("📸 CAPTURE")
                         except:
-                            capture_requested = True
-                            print("📸 CAPTURE")
+                            if gif_mode:
+                                gif_record_requested = True
+                                print("🎞 GIF RECORD")
+                            else:
+                                capture_requested = True
+                                print("📸 CAPTURE")
 
             # --- Preview toggle button ---
             if not GPIO.input(BUTTON_PREVIEW):
@@ -1104,6 +1721,8 @@ preview_active = True
 capture_requested = False
 exit_requested = False
 camera_started = False
+first_preview_frame_pending = True
+cold_start_pending = True   # only the very first preview frame skips the filter
 capturing = False
 show_focus = False
 capture_dot_time = 0
@@ -1118,11 +1737,22 @@ splash_active = False
 awb_mode_index = AWB_MODES.index(next(m for m in AWB_MODES if m[1] == "Daylight"))
 awb_mode_changed = False
 awb_changed_time = 0
+_awb_last_label = None     # tracks AWB label text to pop it when it changes
+_awb_pop_start = 0.0
 filter_index = FILTERS.index("Film Standard")
 saving_active = 0
 _save_active_lock = threading.Lock()
 filter_label_time = 0
 isp_changed = False
+gif_mode = False              # armed for GIF recording (toggled by long-press)
+gif_record_requested = False  # button thread → main loop: start a recording
+gif_recording = False         # True while record_gif() owns the camera/display
+gif_cancel_requested = False  # shutter press during recording → abort + discard
+gif_mode_label_time = 0       # transient "GIF" centre label timestamp
+_gif_anim_frames = []         # decoded frames of the GIF currently in the gallery
+_gif_anim_index = 0
+_gif_anim_last = 0.0
+_gif_anim_file = None         # path of the GIF the frames belong to
 transfer_mode = False
 transfer_screen_shown = False
 _transfer_last_refresh = 0
@@ -1137,9 +1767,13 @@ def main():
     global capturing, show_focus, capture_dot_time, config_cache
     global gallery_active, gallery_index, gallery_images, gallery_needs_update, gallery_confirm_delete, gallery_empty_message_time
     global awb_mode_index, awb_mode_changed, awb_changed_time, no_space_message_time, splash_active
+    global _awb_last_label, _awb_pop_start
     global filter_index, filter_label_time, isp_changed, saving_active
     global transfer_mode, transfer_screen_shown, _transfer_last_refresh, _transfer_last_activity, _transfer_dimmed
     global _idle_last_activity, _idle_dimmed
+    global first_preview_frame_pending, cold_start_pending
+    global gif_mode, gif_record_requested, gif_recording, gif_mode_label_time
+    global _gif_anim_frames, _gif_anim_index, _gif_anim_last, _gif_anim_file
 
     gc.disable()
 
@@ -1149,8 +1783,8 @@ def main():
 
     log("Initializing display...")
     init_display()
-    set_backlight(True)
-    show_splash()
+    show_splash()          # draw the splash first (backlight still off)…
+    set_backlight(True)    # …then light it, so no white flash beforehand
     log("Display ready - showing splash screen")
 
     log("Importing Picamera2 (this may take 10 seconds)...")
@@ -1159,7 +1793,6 @@ def main():
     log("Picamera2 imported")
 
     picam2 = Picamera2()
-    clear_display()
     config_cache = CameraConfigCache(picam2)
 
     print("\n" + "=" * 50)
@@ -1177,6 +1810,20 @@ def main():
 
     button_thread = threading.Thread(target=button_handler, daemon=True)
     button_thread.start()
+
+    # Pre-build the supersampled HUD overlays off the main thread so switching
+    # filters never has to render one mid-preview (the first-launch hitch).
+    def _warm_overlays():
+        for f in FILTERS:
+            try:
+                get_filter_indicator(f)
+            except Exception as e:
+                print(f"warm indicator error: {e}")
+        try:
+            get_gif_mode_indicator(0)   # also warm the GIF-mode pill phases
+        except Exception as e:
+            print(f"warm gif pill error: {e}")
+    threading.Thread(target=_warm_overlays, daemon=True).start()
 
     frame_count = 0
     last_fps_report = time.time()
@@ -1257,8 +1904,33 @@ def main():
                     idx = gallery_index  # snapshot index before load
                     total = len(gallery_images)
                     set_backlight(True)
-                    display_gallery_image(gallery_images[idx], idx + 1, total, gallery_confirm_delete)
+                    is_gif = gallery_images[idx].lower().endswith(".gif")
+                    if is_gif and not gallery_confirm_delete:
+                        # Show frame 0 now; the rest decode in the background and
+                        # stream into this list, so navigation doesn't stall.
+                        _gif_anim_frames = start_gif_gallery_load(gallery_images[idx], idx + 1, total)
+                        _gif_anim_file = gallery_images[idx]
+                        _gif_anim_index = 0
+                        _gif_anim_last = time.time()
+                        if _gif_anim_frames:
+                            display_image(_gif_anim_frames[0])
+                        else:
+                            display_gallery_image(gallery_images[idx], idx + 1, total, False)
+                    else:
+                        # Static photo, or GIF first-frame behind the delete dialog
+                        _gif_anim_frames = []
+                        _gif_anim_file = None
+                        display_gallery_image(gallery_images[idx], idx + 1, total, gallery_confirm_delete)
                     print(f"Gallery: {idx + 1}/{total}")
+
+                # Advance GIF animation while its frame is on screen
+                if (_gif_anim_frames and not gallery_confirm_delete
+                        and gallery_images and gallery_index < len(gallery_images)
+                        and gallery_images[gallery_index] == _gif_anim_file):
+                    if time.time() - _gif_anim_last >= GIF_FRAME_MS / 1000.0:
+                        _gif_anim_last = time.time()
+                        _gif_anim_index = (_gif_anim_index + 1) % len(_gif_anim_frames)
+                        display_image(_gif_anim_frames[_gif_anim_index])
 
                 time.sleep(0.02)
 
@@ -1270,6 +1942,12 @@ def main():
                         picam2.configure(config_cache.preview_config)
                         picam2.start()
                         camera_started = True
+                        first_preview_frame_pending = True
+                        # Reconfiguring resets the ISP — re-apply the active
+                        # filter's saturation/contrast and white balance so the
+                        # full effect is back immediately (e.g. after a capture).
+                        isp_changed = True
+                        awb_mode_changed = True
                         _idle_last_activity = time.time()
                         print("✓ Preview started\n")
 
@@ -1281,6 +1959,14 @@ def main():
                         args=(picam2,),
                         daemon=True
                     ).start()
+
+                # GIF recording runs inline (it owns the display for ~5s),
+                # then falls through and the preview rebuilds at 240.
+                if gif_record_requested:
+                    gif_record_requested = False
+                    _idle_last_activity = time.time()
+                    record_gif(picam2)
+                    continue
 
                 if camera_started and not capturing:
                     try:
@@ -1297,6 +1983,19 @@ def main():
                                 metadata = req.get_metadata()
                                 req.release()
                                 preview_image = preview_image.transpose(Image.ROTATE_90)
+                                if first_preview_frame_pending and cold_start_pending:
+                                    # Genuine cold start only: show one unfiltered
+                                    # frame fast. After a capture/restart we skip
+                                    # this so the filter never visibly drops out.
+                                    cold_start_pending = False
+                                    first_preview_frame_pending = False
+                                    if preview_image.size != (240, 240):
+                                        preview_image = preview_image.resize((240, 240), Image.LANCZOS)
+                                    display_image(preview_image)
+                                    log("First preview frame displayed")
+                                    frame_count += 1
+                                    continue
+                                first_preview_frame_pending = False
                                 preview_image = apply_filter(preview_image)
                                 if preview_image.size != (240, 240):
                                     preview_image = preview_image.resize((240, 240), Image.LANCZOS)
@@ -1324,6 +2023,14 @@ def main():
                                 ax = 15
                                 ay = 15 - b_awb[1]
 
+                                # AWB label animates on any text change — the full name
+                                # on an AWB change and the abbreviation when it takes over.
+                                if awb_label != _awb_last_label:
+                                    _awb_last_label = awb_label
+                                    _awb_pop_start = time.time()
+                                awb_popping = time.time() - _awb_pop_start < AWB_POP_DUR
+                                awb_font_size = 25 if awb_switching else 24
+
                                 # ISO position: bottom left
                                 b_iso = tmp_draw.textbbox((0, 0), iso_val, font=font_hud)
                                 ix = 15
@@ -1337,25 +2044,20 @@ def main():
                                 iy = hud_bottom_y
                                 sy = hud_bottom_y
 
-                                # v2: build a single combined RGBA overlay, do ONE convert/composite/convert
-                                awb_shadow = get_cached_shadow("awb", awb_label, ax, ay, font_awb)
-                                iso_shadow = get_cached_shadow("iso", iso_val, ix, iy, font_hud)
-                                sh_shadow = get_cached_shadow("shutter", shutter_val, sx, sy, font_hud)
-
-                                overlay = Image.alpha_composite(awb_shadow, iso_shadow)
-                                overlay = Image.alpha_composite(overlay, sh_shadow)
-
-                                # Transient centre messages (mutually exclusive)
+                                # Transient centre messages (mutually exclusive).
+                                # This also clears expired timers, so it must run every
+                                # frame regardless of the overlay cache below.
                                 centre_msg = None
-                                centre_msg_key = None
+                                centre_msg_start = 0.0
+                                centre_msg_dur = 1.5
                                 if gallery_empty_message_time > 0 and time.time() - gallery_empty_message_time < 1.0:
                                     centre_msg = "No image in card"
-                                    centre_msg_key = "empty_msg"
+                                    centre_msg_start, centre_msg_dur = gallery_empty_message_time, 1.0
                                 elif gallery_empty_message_time > 0:
                                     gallery_empty_message_time = 0
                                 if centre_msg is None and no_space_message_time > 0 and time.time() - no_space_message_time < 1.0:
                                     centre_msg = "No space in card"
-                                    centre_msg_key = "no_space_msg"
+                                    centre_msg_start, centre_msg_dur = no_space_message_time, 1.0
                                 elif centre_msg is None and no_space_message_time > 0:
                                     no_space_message_time = 0
                                 if (centre_msg is None and filter_label_time > 0
@@ -1363,22 +2065,45 @@ def main():
                                         and gallery_empty_message_time == 0
                                         and no_space_message_time == 0):
                                     centre_msg = FILTERS[filter_index]
-                                    centre_msg_key = "filter_label"
+                                    centre_msg_start, centre_msg_dur = filter_label_time, 1.5
                                 elif centre_msg is None and filter_label_time > 0:
                                     filter_label_time = 0
+                                if (centre_msg is None and gif_mode_label_time > 0
+                                        and time.time() - gif_mode_label_time < 1.5):
+                                    centre_msg = "GIF Mode" if gif_mode else "Photo Mode"
+                                    centre_msg_start, centre_msg_dur = gif_mode_label_time, 1.5
+                                elif centre_msg is None and gif_mode_label_time > 0:
+                                    gif_mode_label_time = 0
 
-                                if centre_msg is not None:
-                                    font_msg = load_font(25)
-                                    _tmp = ImageDraw.Draw(preview_image)
-                                    bbox = _tmp.textbbox((0, 0), centre_msg, font=font_msg)
-                                    mx = (240 - (bbox[2] - bbox[0])) // 2
-                                    my = (240 - (bbox[3] - bbox[1])) // 2
-                                    msg_shadow = get_cached_shadow(centre_msg_key, centre_msg, mx, my, font_msg)
-                                    overlay = Image.alpha_composite(overlay, msg_shadow)
+                                # Visible GIF-pill phase (-1 when not armed) — only flips at the march rate
+                                gif_phase_mod = (int(time.time() * _GIF_PILL_MARCH_HZ) % _GIF_PILL_PHASES) if gif_mode else -1
 
-                                # Filter indicator always on top
-                                indicator = get_filter_indicator(FILTERS[filter_index])
-                                overlay = Image.alpha_composite(overlay, indicator)
+                                # Filter pill bounces briefly after a filter change — while
+                                # popping it's animated on top, so pulled out of the cache then.
+                                pill_popping = (filter_label_time > 0
+                                                and time.time() - filter_label_time < PILL_POP_DUR)
+
+                                # Reuse the assembled shadow overlay when nothing that
+                                # affects it changed; otherwise rebuild and cache it.
+                                # (The centre label and a popping pill are NOT in here —
+                                # they're animated on top below, so they never invalidate it.)
+                                hud_key = (awb_label, iso_val, shutter_val,
+                                           FILTERS[filter_index], gif_phase_mod, pill_popping, awb_popping)
+                                if _hud_overlay_cache["key"] == hud_key:
+                                    overlay = _hud_overlay_cache["img"]
+                                else:
+                                    iso_shadow = get_cached_shadow("iso", iso_val, ix, iy, font_hud)
+                                    sh_shadow = get_cached_shadow("shutter", shutter_val, sx, sy, font_hud)
+                                    overlay = Image.alpha_composite(iso_shadow, sh_shadow)
+                                    if not awb_popping:
+                                        overlay = Image.alpha_composite(
+                                            overlay, get_cached_shadow("awb", awb_label, ax, ay, font_awb))
+                                    if not pill_popping:
+                                        overlay = Image.alpha_composite(overlay, get_filter_indicator(FILTERS[filter_index]))
+                                    if gif_mode:
+                                        overlay = Image.alpha_composite(overlay, get_gif_mode_indicator(gif_phase_mod))
+                                    _hud_overlay_cache["key"] = hud_key
+                                    _hud_overlay_cache["img"] = overlay
 
                                 # Single convert → composite → convert for all shadows/overlays
                                 preview_image = preview_image.convert("RGBA")
@@ -1386,12 +2111,10 @@ def main():
                                 preview_image = preview_image.convert("RGB")
 
                                 draw_hud = ImageDraw.Draw(preview_image)
-                                draw_hud.text((ax, ay), awb_label, font=font_awb, fill=(255, 255, 255))
+                                if not awb_popping:
+                                    draw_hud.text((ax, ay), awb_label, font=font_awb, fill=(255, 255, 255))
                                 draw_hud.text((ix, iy), iso_val, font=font_hud, fill=(255, 255, 255))
                                 draw_hud.text((sx, sy), shutter_val, font=font_hud, fill=(255, 255, 255))
-
-                                if centre_msg is not None:
-                                    draw_hud.text((mx, my), centre_msg, font=font_msg, fill=(255, 255, 255))
 
                                 # Saving spinner — bottom centre, vertically aligned with ISO/shutter
                                 if saving_active > 0:
@@ -1403,6 +2126,24 @@ def main():
                                     sp_box_s = [sp_cx-sp_r+1, sp_cy-sp_r+1, sp_cx+sp_r+1, sp_cy+sp_r+1]
                                     draw_hud.arc(sp_box_s, start=sp_a, end=sp_a+270, fill=(0, 0, 0),       width=2)
                                     draw_hud.arc(sp_box,   start=sp_a, end=sp_a+270, fill=(255, 255, 255), width=2)
+
+                                # AWB label pop (scale, on top) on change / full→abbrev switch
+                                if awb_popping:
+                                    preview_image = render_pill_pop(
+                                        preview_image, get_awb_sprite(awb_label, awb_font_size),
+                                        _awb_pop_scale(time.time() - _awb_pop_start, awb_switching))
+
+                                # Filter pill bounce (subtle scale, on top) right after a change
+                                if pill_popping:
+                                    preview_image = render_pill_pop(
+                                        preview_image, get_filter_indicator(FILTERS[filter_index]),
+                                        _pill_pop_scale(time.time() - filter_label_time))
+
+                                # Animated centre label (filter name / mode toast) — fade + bounce, on top
+                                if centre_msg is not None:
+                                    preview_image = render_centre_msg(
+                                        preview_image, centre_msg,
+                                        time.time() - centre_msg_start, centre_msg_dur)
 
                                 display_image(preview_image)
                                 frame_count += 1
