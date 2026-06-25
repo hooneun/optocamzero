@@ -1,6 +1,12 @@
 [Unit]
 Description=Optocam Zero Camera System
+# Start as early as possible — only wait for the root filesystem, NOT for
+# pigpiod/basic.target/sysinit. The script's own readiness waits (connect_pigpiod,
+# /dev/gpiomem + /dev/spidev0.0 waits, camera-enumeration wait) handle hardware
+# that udev hasn't probed yet, so the heavy imports overlap device bring-up.
+# Wants (not After) pigpiod so the daemon still launches without gating us on it.
 After=local-fs.target
+Wants=pigpiod.service
 DefaultDependencies=false
 ConditionPathExists=/home/dkumkum/optocamzero.py
 

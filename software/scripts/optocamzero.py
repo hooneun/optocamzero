@@ -6,6 +6,26 @@ def log(msg):
     sys.stderr.write(f"[{time.time() - _script_start:.2f}s] {msg}\n")
     sys.stderr.flush()
 log("Script file started")
+
+# ── Lazy-av shim ──────────────────────────────────────────────────────────────
+# picamera2 unconditionally `import av` (PyAV/ffmpeg) for its video encoders,
+# which costs ~2.25s at import (loading libavcodec/format/util/swscale). The
+# Optocam only does stills + manually-assembled GIFs and never touches a
+# picamera2 encoder, so we install a lazy stand-in for `av`: importing it is
+# free, and the real ffmpeg libraries only load if something actually accesses
+# an attribute (which never happens here). Saves ~2.5s of cold-boot time.
+import types as _types
+import importlib as _importlib
+class _LazyAv(_types.ModuleType):
+    def __getattr__(self, name):
+        del sys.modules['av']                       # drop the stub…
+        real = _importlib.import_module('av')       # …load the genuine PyAV…
+        return getattr(real, name)                  # …and delegate.
+if 'av' not in sys.modules:
+    sys.modules['av'] = _LazyAv('av')
+log("lazy-av shim installed")
+# ──────────────────────────────────────────────────────────────────────────────
+
 import RPi.GPIO as GPIO
 log("GPIO imported")
 import pigpio
@@ -14,16 +34,61 @@ import spidev
 log("spidev imported")
 import threading
 log("threading imported")
+
+# Preload the two heavy modules that are NOT on the first-preview path —
+# picamera2 (~1.2s) and PIL.Image — on a background thread so they overlap with
+# numpy + display init on the main thread. picamera2 is only used in main() after
+# the join; PIL.Image is only touched by HUD/overlay code (warm-overlays thread),
+# which runs well after the join. numpy stays on the main thread because the
+# module-level RGB565 LUTs below need it immediately.
+Image = None  # populated by the preload thread before any overlay code runs
+def _preload_heavy():
+    global Image
+    import picamera2  # noqa: F401 — populates sys.modules for the instant import in main()
+    from PIL import Image as _Image
+    Image = _Image
+_preload_thread = threading.Thread(target=_preload_heavy, daemon=True)
+_preload_thread.start()
+log("heavy-preload thread started (picamera2 + PIL)")
+
 import os
 log("os imported")
-log("datetime skipped")
-from PIL import Image
-log("PIL imported")
 import numpy as np
 log("numpy imported")
 import gc
 import subprocess
 log("All imports done")
+
+# ── Early-start readiness waits ───────────────────────────────────────────────
+# camera-auto.service starts before udev coldplug finishes, so the heavy imports
+# above (numpy, picamera2, PIL) overlap kernel device bring-up instead of running
+# serially after it. The trade-off: the device nodes below may not exist yet when
+# we reach them, so block here until they do rather than crashing on absent hardware.
+def _wait_for_path(path, timeout=30):
+    end = time.time() + timeout
+    while not os.path.exists(path):
+        if time.time() > end:
+            log(f"WARN: timed out waiting for {path}")
+            return False
+        time.sleep(0.02)
+    return True
+
+def connect_pigpiod(timeout=30):
+    """pigpiod may not be up yet (it also waits on gpiomem). Retry until it is."""
+    end = time.time() + timeout
+    while True:
+        pi = pigpio.pi()
+        if pi.connected:
+            return pi
+        pi.stop()
+        if time.time() > end:
+            log("WARN: pigpiod connect timed out")
+            return pi
+        time.sleep(0.1)
+
+_wait_for_path('/dev/gpiomem')      # RPi.GPIO needs this
+_wait_for_path('/dev/spidev0.0')    # SPI display needs this
+log("hardware nodes ready")
 # Force clean GPIO
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
@@ -50,7 +115,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(RST_PIN, GPIO.OUT)
 GPIO.setup(DC_PIN, GPIO.OUT)
 GPIO.setup(BL_PIN, GPIO.OUT)
-_pi = pigpio.pi()
+_pi = connect_pigpiod()
 _pi.set_PWM_frequency(BL_PIN, 1000)
 # Keep the backlight OFF until the splash is actually drawn — otherwise it lights
 # the uninitialised (white) panel for ~2s during boot before the splash appears.
@@ -1787,10 +1852,22 @@ def main():
     set_backlight(True)    # …then light it, so no white flash beforehand
     log("Display ready - showing splash screen")
 
-    log("Importing Picamera2 (this may take 10 seconds)...")
+    log("Waiting for heavy-preload thread (picamera2 + PIL)...")
     print("Initializing camera...")
-    from picamera2 import Picamera2
+    _preload_thread.join()
+    from picamera2 import Picamera2  # instant — already imported by the preload thread
     log("Picamera2 imported")
+
+    # Early-start safety: the imx708 may still be probing when we start this early.
+    # Wait for libcamera to enumerate it before constructing Picamera2 (which would
+    # otherwise raise on a not-yet-present camera).
+    _cam_t0 = time.time()
+    while not Picamera2.global_camera_info():
+        if time.time() - _cam_t0 > 30:
+            log("WARN: camera enumeration timed out")
+            break
+        time.sleep(0.05)
+    log("camera enumerated")
 
     picam2 = Picamera2()
     config_cache = CameraConfigCache(picam2)

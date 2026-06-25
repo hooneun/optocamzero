@@ -111,6 +111,18 @@ add_if_missing "dtoverlay=spi1-3cs"
 add_if_missing "disable_fw_kms_setup=1"
 add_if_missing "disable_overscan=1"
 
+# NOTE: do NOT remove vc4-kms-v3d (it ships in the base Pi OS config.txt). It sets
+# the CMA pool to 256MB; without it the pool drops to 64MB and full-resolution
+# capture fails with "Cannot allocate memory" — preview still works, which hides the
+# bug. The SPI display is script-driven and doesn't need KMS, but the camera's
+# capture DMA buffers are allocated from the CMA pool that vc4-kms-v3d reserves.
+
+# OPTIONAL (~1s faster boot): overclock the SD bus 50->100MHz. Speeds every
+# Linux-phase read (numpy import, module loading). Verified stable on the dev unit's
+# A2 card, but it is card/board-specific — uncomment, then check `dmesg | grep mmc`
+# for errors/CRC after a reboot before relying on it.
+# add_if_missing "dtparam=sd_overclock=100"
+
 # Boot parameters
 CMDLINE=/boot/firmware/cmdline.txt
 if ! grep -q "spidev.bufsiz" "$CMDLINE"; then
@@ -121,6 +133,64 @@ if ! grep -q "quiet" "$CMDLINE"; then
 fi
 if ! grep -q "consoleblank" "$CMDLINE"; then
     sed -i 's/$/ consoleblank=0/' "$CMDLINE"
+fi
+
+# ── 6b. Boot-speed system tuning ──────────────────────────────────────────────
+echo -e "${YELLOW}[6b/8] Applying boot-speed optimizations...${NC}"
+
+# Disable the USB host controller — WiFi is SDIO and nothing else uses USB, so the
+# dwc_otg init (~0.9s of kernel time) is pure overhead. No stock overlay exists, so
+# compile a tiny one that marks the USB node disabled. (Pi Zero 2 W / BCM2710.)
+if ! command -v dtc >/dev/null 2>&1; then
+    apt-get install -y device-tree-compiler
+fi
+cat > /tmp/disable-usb.dts << 'DTS'
+/dts-v1/;
+/plugin/;
+/ {
+    fragment@0 {
+        target-path = "/soc/usb@7e980000";
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+};
+DTS
+if dtc -@ -I dts -O dtb -o /boot/firmware/overlays/disable-usb.dtbo /tmp/disable-usb.dts 2>/dev/null; then
+    add_if_missing "dtoverlay=disable-usb"
+fi
+
+# Load the camera stack at sysinit instead of waiting for udev coldplug (~7.5s), so
+# the camera is probed by the time the early-starting script opens it. modprobe
+# pulls in dependencies; module names absent on a given kernel are simply skipped.
+cat > /etc/modules-load.d/optocam-camera.conf << 'EOF'
+i2c-bcm2835
+bcm2835-isp
+bcm2835-unicam-legacy
+dw9807-vcm
+imx708
+EOF
+
+# Blacklist the bcm2835 audio module (audio is off anyway). NOTE: the HDMI-audio
+# snd_soc modules get pulled in as hard DEPENDENCIES of vc4-kms-v3d and load
+# regardless of this blacklist (and vc4-kms-v3d must stay — see CMA note above), so
+# the saving is small. It costs nothing, so we keep it to avoid the snd_bcm2835 load.
+cat > /etc/modprobe.d/optocam-blacklist.conf << 'EOF'
+blacklist snd_bcm2835
+blacklist snd_soc_hdmi_codec
+blacklist snd_soc_core
+blacklist snd_pcm
+blacklist snd_pcm_dmaengine
+blacklist snd_compress
+blacklist snd_timer
+blacklist snd
+EOF
+
+# Defer the /boot/firmware (FAT) mount so its fsck+mount stops gating sysinit
+# (~0.8s). The firmware already read config.txt before Linux; nothing at runtime
+# needs it mounted, and x-systemd.automount mounts it on demand (e.g. apt updates).
+if ! grep -q 'x-systemd.automount' /etc/fstab; then
+    sed -i -E 's#^(PARTUUID=\S+\s+/boot/firmware\s+vfat\s+)defaults(\s+)[0-9](\s+)[0-9]#\1defaults,nofail,x-systemd.automount\20\30#' /etc/fstab
 fi
 
 # ── 7. Enable services ────────────────────────────────────────────────────────
