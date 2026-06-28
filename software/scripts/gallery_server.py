@@ -45,7 +45,7 @@ HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>OptoCam</title>
+<title>Optocam Zero</title>
 <style>
 @font-face {
     font-family: 'CamFont';
@@ -65,8 +65,8 @@ body {
 body:has(#viewer.open) { background: #000; }
 header {
     border-bottom: 1px solid #1e1e1e;
-    padding-top: 21px;    /* less top than bottom to offset the 14px body padding above */
-    padding-bottom: 35px;
+    padding-top: 11px;    /* less top than bottom to offset the 14px body padding above */
+    padding-bottom: 25px;
     margin-bottom: 14px;
     /* Stretch past the body's 14px padding so the divider spans the full width. */
     margin-left: -14px;
@@ -77,7 +77,7 @@ header {
 }
 .logo { height: 30px; width: auto; display: block; }
 @media (min-width: 768px) {
-    header { padding-top: 26px; padding-bottom: 40px; }
+    header { padding-top: 16px; padding-bottom: 30px; }
 }
 .meta {
     display: flex;
@@ -243,6 +243,27 @@ header {
     z-index: 2;
     pointer-events: none;
 }
+/* Spinner over a GIF poster whose animation is still loading in the
+   background. Hidden until the poster JPG has actually loaded (gets `.show`
+   in JS), and removed the moment the live GIF swaps in. Sits above the image
+   but below the badge/controls, and ignores clicks. */
+.grid-spin {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 30px;
+    height: 30px;
+    margin: -15px 0 0 -15px;
+    border: 2px solid rgba(255,255,255,0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    z-index: 1;
+    pointer-events: none;
+    filter: drop-shadow(0 0 1px rgba(0,0,0,0.65));
+    display: none;
+}
+.grid-spin.show { display: block; }
 
 /* ── Toolbar (meta + filter/order controls), below the header divider ── */
 .toolbar {
@@ -338,6 +359,42 @@ header {
     border-bottom: 1px solid #1a1a1a;
     flex-shrink: 0;
 }
+/* Counter + filename live in a bottom bar (below the image) on all sizes now,
+   so the header's center copy is unused. */
+.viewer-info { display: none; }
+.viewer-controls { display: flex; align-items: center; gap: 8px; }
+.viewer-fname {
+    font-size: 12px;
+    color: #666;
+    letter-spacing: 0.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+/* Bottom bar under the image: filename left-aligned, counter right-aligned
+   (set by markup order). Full-width divider continuous with the nav line. */
+.viewer-info-m {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 14px;
+    border-top: 1px solid #1a1a1a;
+    flex-shrink: 0;
+}
+@media (min-width: 768px) {
+    /* Match the bottom bar's height to the top header (57px: 32px controls +
+       12px*2 padding + 1px border), and group filename + counter together in
+       the center rather than pushing them to the edges. */
+    .viewer-info-m {
+        min-height: 57px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        justify-content: center;
+        gap: 40px;
+    }
+}
 .viewer-back {
     font-family: 'CamFont', monospace;
     font-size: 13px;
@@ -368,6 +425,20 @@ header {
     text-decoration: none;
 }
 .viewer-dl svg { width: 14px; height: 14px; }
+.viewer-del {
+    width: 32px;
+    height: 32px;
+    background: #141414;
+    border: 1px solid #3a1a1a;
+    border-radius: 50%;
+    color: #e8554f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+}
+.viewer-del svg { width: 14px; height: 14px; }
 .viewer-hq {
     width: 32px;
     height: 32px;
@@ -385,7 +456,7 @@ header {
     padding-left: 1px;
     transition: border-color 0.15s, color 0.15s;
 }
-.viewer-hq.active { border-color: #888; color: #aaa; }
+.viewer-hq.active { border-color: #888; color: #fff; }
 .viewer-body {
     flex: 1;
     display: flex;
@@ -450,11 +521,29 @@ header {
         transition: color 0.15s;
     }
     .side-nav:hover { color: #ccc; }
+    /* 12px inside the constrained viewer-body, i.e. at the image column edge. */
     .side-nav.left-nav { left: 12px; }
     .side-nav.right-nav { right: 12px; }
 }
 @media (min-width: 1200px) {
     .side-nav svg { width: 19px; height: 19px; }
+}
+@media (min-width: 768px) {
+    /* Header + bottom bar stay full-width so their divider lines span the whole
+       screen, with their content constrained to the gallery column via padding.
+       The image area (viewer-body) IS constrained to the column so the side-nav
+       arrows, positioned inside it, sit at the column edge. */
+    .viewer-header {
+        padding-left: max(14px, calc((100% - 1400px) / 2));
+        padding-right: max(14px, calc((100% - 1400px) / 2));
+    }
+    .viewer-body {
+        width: 100%;
+        max-width: 1428px;
+        margin-left: auto;
+        margin-right: auto;
+        padding: 0 14px;
+    }
 }
 
 /* ── Selection bar ── */
@@ -726,7 +815,7 @@ body:has(#sel-bar.open) #dl-progress {
       <button class="img-btn" onclick="openViewer(this)">
         <img src="/thumb/{{ f }}" loading="lazy" alt="{{ f }}" draggable="false">
       </button>
-      {% if f.lower().endswith('.gif') %}<span class="gif-badge">GIF</span>{% endif %}
+      {% if f.lower().endswith('.gif') %}<span class="gif-badge">GIF</span><div class="grid-spin"></div>{% endif %}
       <button class="sel-circle" onclick="toggleSel(event, this)"></button>
       <a class="dl-icon" href="/photo/{{ f }}" download="{{ f }}" onclick="event.stopPropagation()">
         <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
@@ -745,12 +834,17 @@ body:has(#sel-bar.open) #dl-progress {
 <!-- Viewer -->
 <div id="viewer">
   <div class="viewer-header" onclick="event.stopPropagation()">
-    <button class="viewer-back" onclick="closeViewer()"><svg viewBox="0 0 16 16" width="13" height="13" xmlns="http://www.w3.org/2000/svg" style="position:relative;top:-1px;"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>BACK</button>
-    <div style="display:flex;flex-direction:column;align-items:center;gap:3px;">
-      <span class="viewer-pos" id="viewer-pos"></span>
-      <span id="viewer-filename" style="font-size:12px;color:#666;letter-spacing:0.5px;"></span>
+    <button class="viewer-back" onclick="closeViewer()"><svg viewBox="0 0 16 16" width="13" height="13" xmlns="http://www.w3.org/2000/svg" style="position:relative;top:-2px;"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>BACK</button>
+    <div class="viewer-info">
+      <span class="viewer-fname"></span>
+      <span class="viewer-pos"></span>
     </div>
-    <div style="display:flex;align-items:center;gap:8px;">
+    <div class="viewer-controls">
+      <button class="viewer-del" id="viewer-del" onclick="confirmDeleteCurrent()" aria-label="Delete">
+        <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+          <path d="M2 3.5h12M5.5 3.5V1.5h5v2M3.5 3.5l.8 10h7.4l.8-10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        </svg>
+      </button>
       <button class="viewer-hq" id="viewer-hq" onclick="toggleHQ()">HQ</button>
       <a class="viewer-dl" id="viewer-dl" href="#" download>
         <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
@@ -761,9 +855,13 @@ body:has(#sel-bar.open) #dl-progress {
   </div>
   <div class="viewer-body" id="viewer-body" onclick="if(window.innerWidth>=1200)closeViewer()">
     <div class="spinner" id="spinner"></div>
-    <img id="viewer-img" src="" alt="" onload="imgLoaded()" onclick="event.stopPropagation()" style="display:none;">
+    <img id="viewer-img" src="" alt="" onload="imgLoaded()" onerror="imgFailed()" onclick="event.stopPropagation()" style="display:none;">
     <button class="side-nav left-nav" onclick="event.stopPropagation();stepViewer(-1)"><svg viewBox="0 0 16 16" width="16" height="16" xmlns="http://www.w3.org/2000/svg"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></button>
     <button class="side-nav right-nav" onclick="event.stopPropagation();stepViewer(1)"><svg viewBox="0 0 16 16" width="16" height="16" xmlns="http://www.w3.org/2000/svg"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></button>
+  </div>
+  <div class="viewer-info-m">
+    <span class="viewer-fname"></span>
+    <span class="viewer-pos"></span>
   </div>
   <div class="viewer-nav">
     <button class="nav-btn" onclick="stepViewer(-1)"><svg viewBox="0 0 16 16" width="14" height="14" xmlns="http://www.w3.org/2000/svg"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></button>
@@ -810,7 +908,7 @@ body:has(#sel-bar.open) #dl-progress {
   <div id="confirm-box">
     <p id="confirm-msg"></p>
     <div class="confirm-btns">
-      <button id="confirm-yes" onclick="deleteSelected()">DELETE</button>
+      <button id="confirm-yes" onclick="confirmYes()">DELETE</button>
       <button id="confirm-no" onclick="closeConfirm()">CANCEL</button>
     </div>
   </div>
@@ -1024,10 +1122,11 @@ function updateViewer() {
     img.style.display = 'none';
     spinner.classList.add('active');
     // GIFs always play their full animated original; photos use the sized thumb / HQ
-    img.src = gif ? '/thumb/' + f : (hqMode ? '/photo/' + f : '/thumb/' + f + '?size=1200');
+    img.src = gif ? '/gif/' + f : (hqMode ? '/photo/' + f : '/thumb/' + f + '?size=1200');
     document.getElementById('viewer-hq').style.display = gif ? 'none' : 'flex';
-    document.getElementById('viewer-pos').textContent = (viewerIdx + 1) + ' / ' + files.length;
-    document.getElementById('viewer-filename').textContent = f;
+    const posText = (viewerIdx + 1) + ' / ' + files.length;
+    document.querySelectorAll('.viewer-pos').forEach(e => e.textContent = posText);
+    document.querySelectorAll('.viewer-fname').forEach(e => e.textContent = f);
     const dl = document.getElementById('viewer-dl');
     dl.href = '/photo/' + f;
     dl.download = f;
@@ -1037,6 +1136,76 @@ function imgLoaded() {
     document.getElementById('spinner').classList.remove('active');
     document.getElementById('viewer-img').style.display = 'block';
 }
+
+function imgFailed() {
+    // Don't leave the viewer spinning forever if a load fails.
+    document.getElementById('spinner').classList.remove('active');
+}
+
+// --- Progressive GIF previews in the grid ------------------------------
+// Grid cells first show a tiny static first-frame JPEG (fast, reliable, never
+// a broken "?"). Then, only for GIFs scrolled near the viewport, we fetch the
+// full animated original in the background — just a couple at a time so we
+// never stampede the Pi the way loading every GIF at once did — and swap it in
+// once it has decoded. If the animated fetch fails, the static poster stays.
+const GIF_CONCURRENCY = 2;
+const gifQueue = [];
+const gifQueued = new Set();
+let gifActive = 0;
+
+function pumpGifQueue() {
+    while (gifActive < GIF_CONCURRENCY && gifQueue.length) {
+        const item = gifQueue.shift();
+        const gridImg = item.querySelector('img');
+        if (!gridImg) continue;
+        gifActive++;
+        const stopSpin = () => { const sp = item.querySelector('.grid-spin'); if (sp) sp.remove(); };
+        const loader = new Image();
+        // Animation ready → swap poster for the live GIF and drop the spinner.
+        loader.onload = () => { gridImg.src = loader.src; stopSpin(); gifActive--; pumpGifQueue(); };
+        // Failed → keep the static poster, but stop spinning (don't hang).
+        loader.onerror = () => { stopSpin(); gifActive--; pumpGifQueue(); };
+        loader.src = '/gif/' + encodeURIComponent(item.dataset.file);
+    }
+}
+
+function enqueueGif(item) {
+    const f = item.dataset.file;
+    if (gifQueued.has(f)) return;
+    gifQueued.add(f);
+    gifQueue.push(item);
+    pumpGifQueue();
+}
+
+const gifObserver = ('IntersectionObserver' in window)
+    ? new IntersectionObserver((entries, obs) => {
+        entries.forEach(e => {
+            if (!e.isIntersecting) return;
+            obs.unobserve(e.target);   // load once, then leave it animating
+            enqueueGif(e.target);
+        });
+      }, { rootMargin: '300px' })
+    : null;
+
+// Show the spinner only once the static poster is actually on screen (its
+// JPG has loaded); until then there's nothing to overlay. It's removed later
+// when the animated GIF swaps in (or fails) via stopSpin().
+function revealSpinnerWhenPosterLoads(item) {
+    const sp = item.querySelector('.grid-spin');
+    const img = item.querySelector('img');
+    if (!sp || !img) return;
+    if (img.complete && img.naturalWidth > 0) sp.classList.add('show');
+    else img.addEventListener('load', () => sp.classList.add('show'), { once: true });
+}
+
+(function observeGifs() {
+    Object.values(itemEls).forEach(item => {
+        if (!isGif(item.dataset.file)) return;
+        revealSpinnerWhenPosterLoads(item);
+        if (gifObserver) gifObserver.observe(item);   // hidden/filtered items fire when shown
+        else enqueueGif(item);                        // no observer: just load all (throttled)
+    });
+})();
 
 window.addEventListener('load', () => fetch('/preload'));
 
@@ -1307,19 +1476,66 @@ function hideProgress() {
     document.getElementById('dl-progress-fill').style.width = '0';
 }
 
-function confirmDelete() {
-    const n = selected.size;
-    document.getElementById('confirm-msg').textContent =
-        'Delete ' + n + ' image' + (n !== 1 ? 's' : '') + '? This cannot be undone.';
+// null → confirming a selection delete; a filename → confirming that one image
+// (from the viewer). The shared confirm popup dispatches on this in confirmYes().
+let pendingDeleteFile = null;
+
+function openConfirm(msgHtml) {
+    document.getElementById('confirm-msg').innerHTML = msgHtml;
     const ov = document.getElementById('confirm-overlay');
     ov.style.display = 'flex';
     ov.style.pointerEvents = 'auto';
+}
+
+function confirmDelete() {
+    pendingDeleteFile = null;
+    const n = selected.size;
+    openConfirm('Delete ' + n + ' image' + (n !== 1 ? 's' : '') + '?<br>This cannot be undone.');
+}
+
+function confirmDeleteCurrent() {
+    pendingDeleteFile = files[viewerIdx];
+    openConfirm('Delete this image?<br>This cannot be undone.');
+}
+
+function confirmYes() {
+    if (pendingDeleteFile !== null) deleteCurrent();
+    else deleteSelected();
 }
 
 function closeConfirm() {
     const ov = document.getElementById('confirm-overlay');
     ov.style.display = 'none';
     ov.style.pointerEvents = 'none';
+}
+
+async function deleteCurrent() {
+    closeConfirm();
+    const f = pendingDeleteFile;
+    pendingDeleteFile = null;
+    if (!f) return;
+    const res = await fetch('/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({files: [f]})
+    });
+    if (!res.ok) return;
+    const wasIdx = files.indexOf(f);   // slot to land on after removal
+    const el = itemEls[f];
+    if (el) el.remove();
+    delete itemEls[f];
+    selected.delete(f);
+    const aidx = allFiles.indexOf(f);
+    if (aidx !== -1) allFiles.splice(aidx, 1);
+    refreshSelBar();
+    applyView();   // rebuilds `files` (and count / empty state)
+    if (files.length === 0) {
+        closeViewer();
+    } else {
+        // Show whatever now occupies the deleted slot, or the new last image.
+        viewerIdx = Math.min(Math.max(wasIdx, 0), files.length - 1);
+        updateViewer();
+    }
 }
 
 async function deleteSelected() {
@@ -1560,12 +1776,18 @@ def index():
             sizes[f] = os.path.getsize(os.path.join(PHOTOS_DIR, f))
         except OSError:
             sizes[f] = 0
-    return render_template_string(
+    html = render_template_string(
         HTML, files=files, count=len(files), has_media=bool(files),
         free_space=get_free_space(),
         files_json=json.dumps(files), gifs_json=json.dumps(gif_set),
         sizes_json=json.dumps(sizes)
     )
+    # The page embeds all CSS/JS inline, so never let the browser serve a stale
+    # copy — otherwise UI changes appear not to take effect after a redeploy.
+    # (Thumbnails/GIFs keep their own immutable caching, so this costs nothing.)
+    resp = Response(html)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/logo")
@@ -1589,20 +1811,42 @@ def get_thumb_path(filename, size):
     os.makedirs(THUMB_DIR, exist_ok=True)
     return os.path.join(THUMB_DIR, f"{filename}_{size}.jpg")
 
+def _gif_complete(path):
+    """A fully-written GIF ends with the trailer byte 0x3B. The camera encodes
+    GIFs in place at their final name, so a request can briefly land mid-write;
+    this rejects those partial files instead of serving truncated bytes."""
+    try:
+        if os.path.getsize(path) < 1000:
+            return False
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\x3b"
+    except OSError:
+        return False
+
 @app.route("/thumb/<filename>")
 def thumb(filename):
+    # Static preview for the grid. For GIFs this is a JPEG of the first frame —
+    # the full animation is served separately by /gif so the heavy multi-frame
+    # file isn't pulled for every grid cell at once (the cause of dropped
+    # transfers / broken "?" previews under load).
     path = os.path.join(PHOTOS_DIR, filename)
     if not os.path.exists(path):
         return "Not found", 404
-    # GIFs are served inline as-is so they animate in the grid and viewer —
-    # resizing would flatten them to a single frame.
-    if filename.lower().endswith(".gif"):
-        return send_from_directory(PHOTOS_DIR, filename, mimetype="image/gif")
+    is_gif = filename.lower().endswith(".gif")
+    if is_gif and not _gif_complete(path):
+        resp = Response("GIF not ready", status=503, mimetype="text/plain")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Retry-After"] = "1"
+        return resp
     size = min(request.args.get('size', 400, type=int), 1200)
     cache_path = get_thumb_path(filename, size)
     if not os.path.exists(cache_path) or os.path.getsize(cache_path) == 0:
         from PIL import Image
         img = Image.open(path)
+        if is_gif:
+            img.seek(0)                 # poster = first frame
+        img = img.convert("RGB")        # GIFs are mode "P"; JPEG needs RGB
         img.thumbnail((size, size))
         tmp = tempfile.NamedTemporaryFile(dir=THUMB_DIR, delete=False, suffix='.tmp')
         try:
@@ -1616,6 +1860,26 @@ def thumb(filename):
             return "Error", 500
     with open(cache_path, "rb") as f:
         return Response(f.read(), mimetype="image/jpeg")
+
+
+@app.route("/gif/<filename>")
+def gif_full(filename):
+    """Full animated GIF, served inline. Used by the viewer and by the grid's
+    background loader to swap a static poster for the live animation. Filenames
+    are unique and never rewritten once complete, so it caches hard."""
+    if not filename.lower().endswith(".gif"):
+        return "Not found", 404
+    path = os.path.join(PHOTOS_DIR, filename)
+    if not os.path.exists(path):
+        return "Not found", 404
+    if not _gif_complete(path):
+        resp = Response("GIF not ready", status=503, mimetype="text/plain")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Retry-After"] = "1"
+        return resp
+    resp = send_from_directory(PHOTOS_DIR, filename, mimetype="image/gif")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/preload")
