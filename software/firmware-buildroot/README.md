@@ -1,7 +1,7 @@
 # Optocam Zero Buildroot firmware
 
 Current fast-boot firmware source for Optocam Zero. The older Raspberry Pi OS /
-Python version is kept in `../python-legacy/`.
+Python version is kept in [`../python-legacy/`](../python-legacy/).
 
 ## Contents
 
