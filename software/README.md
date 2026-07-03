@@ -32,7 +32,7 @@ Insert the SD card into the Pi and power it on. The camera boots to the preview 
 
 ## Interface/ Controls
 
-The device is turned on and off using the power switch on the right side. Reaching the camera preview after turning on the device takes 22 seconds.
+The device is turned on and off using the power switch on the right side. Reaching the camera preview after turning on the device takes 5 seconds.
 
 Camera focus is set to continuous auto and cannot be adjusted manually. Camera shutter speed and ISO are set to auto and cannot be adjusted manually.
 
