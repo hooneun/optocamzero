@@ -73,5 +73,5 @@ See the [hardware](hardware/) folder for:
 
 See the [software](software/) folder for: 
 
-- Optocam Zero installation guide.
+- Optocam Zero code and installation guide.
 - Camera controls information.
