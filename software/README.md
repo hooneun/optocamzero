@@ -1,4 +1,4 @@
-# Optocam Zero Software Installation and Interface Controls
+# Optocam Zero Firmware Installation and Interface Controls
 
 <br>
 
@@ -12,55 +12,21 @@
 
 ## Installation
 
-**1. Flash the SD card**
+**1. Download the firmware image**
 
-Download Raspberry Pi Imager from [raspberrypi.com/software](https://www.raspberrypi.com/software/) and install it. Select **Raspberry Pi Zero 2W** as the device and **Raspberry Pi OS Lite (32-bit) Bookworm** as the OS. You can find it under Raspberry Pi OS (other).
+Download the latest Optocam Zero image (`.img`) from the [releases page](https://github.com/dorukkumkumoglu/optocamzero/releases/latest).
 
-Before flashing, click **Edit Settings** and fill in your hostname, username, password, and WiFi credentials (remember to take note of this info). Go to the Services tab and enable SSH. Click Save, then flash the card.
+**2. Flash the SD card**
 
-**2. First boot**
+Download Raspberry Pi Imager from [raspberrypi.com/software](https://www.raspberrypi.com/software/) and install it. Select **Raspberry Pi Zero 2W** as the device. Under **Choose OS**, scroll to the bottom and select **Use custom**, then pick the image file you just downloaded.
 
-Insert the SD card into the Pi and power it on. Wait about 1-2 minutes for it to boot and connect to your WiFi.
+Select your SD card under **Choose Storage**, then click **Write**. If asked whether to apply OS customisation settings, choose **No** — the firmware is preconfigured.
 
-**3. Connect via SSH**
+**3. First boot**
 
-Open Terminal on your computer and run:
-
-```
-ssh your-username@your-hostname.local
-```
-
-Type `yes` when asked about the fingerprint, then enter your password.
-
-**4. Run the installer**
-
-```
-sudo apt-get update
-```
-
-```
-sudo apt-get install -y git
-```
-
-```
-git clone https://github.com/dorukkumkumoglu/optocamzero.git && sudo bash optocamzero/software/python-legacy/install.sh
-```
-
-Installation takes about 10-15 minutes. The Pi reboots automatically when done and the camera starts immediately.
+Insert the SD card into the Pi and power it on. The camera boots to the preview in about 5 seconds and is ready to use.
 
 <br>
-
-## Troubleshooting
-
-**SSH shows "host key changed" error:**
-```
-ssh-keygen -R your-hostname.local
-```
-
-**Camera does not start after reboot:**
-```
-sudo systemctl status camera-auto.service
-```
 
 <br>
 
